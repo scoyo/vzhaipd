@@ -1,0 +1,927 @@
+#!/bin/bash -
+#
+# scoyo Virtuozzo HA IP Script
+#
+# Description: the purpose of this script is to make sure that
+#              one or more IP addresses are always available on one of
+#              two or more containers
+#
+# Manual: to generate the documentation just use one of the following commands on this file
+#         perldoc, pod2usage, pod2html, pod2man - note that the script itself doesn't use
+#         any perl code. We just embedded all documentation in POD format.
+#
+# Warning: make sure this script as well as HA_IP_FILE and VZHAIPD_CONFIG are 0700/0600.
+#          Also note that if either of the two reside within a container,
+#          the container's root user might mess up your host system!
+#          And please be careful what START_CMD and STOP_CMD you define. Both can be
+#          overridden in VZHAIPD_CONFIG!
+#
+# Note: this script is meant to be run with two or more containers each running on
+#       a different host system. if you run the script with two containers on the same
+#       host system it will work, however it will constantly try to become master, fail and
+#       fall back to slave mode since it won't get it's arp requests answered. this is not
+#       a problem per se but it's ugly and also having a ha script run on the same hardware
+#       doesn't seem to be a very smart choice now does it?
+#
+#   Copyright [2008-2009] [scoyo GmbH]
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+#  Author: Lukas Loesche <lukas.loesche@scoyo.com>
+#  $LastChangedDate: 2009-02-19 15:57:57 +0100 (Thu, 19 Feb 2009) $
+#  $LastChangedBy: lukas $
+#  $LastChangedRevision: 2159 $
+#
+
+\unalias -a
+#export PATH=$(getconf PATH)
+hash -r
+ulimit -H -c 0 --
+
+if [ -z "$VEID" ]
+then
+	echo "no VEID set... aborting"
+	exit 1
+fi
+
+export CONTAINER_ID=$VEID
+
+############### START OF DEFAULT CONFIGURATION ###############
+## these are all default values. most of them can be
+## overridden in the VZHAIPD_CONFIG file
+HA_CLUSTER_IP="172.24.224.1"										# the ha ip that our arp check probes for
+HA_INTERFACE="bond0"												# which interface to use for arp requests
+HA_IP_FILE="/vz/root/$CONTAINER_ID/etc/vzhaipd.cips"				# what additional ips to failover
+START_CMD="vzctl exec $CONTAINER_ID svc -u /service/protobalance"	# command to execute after we become master
+STOP_CMD="vzctl exec $CONTAINER_ID svc -d /service/protobalance"	# command to execute before we become slave/shut down
+LOG_LEVEL=99														# global loglevel
+LOG_FILE="/vz/root/$CONTAINER_ID/var/log/vzhaipd.$CONTAINER_ID.log"	# if set log to file else output to stdout/stderr
+DAEMON_PIDFILE="/var/run/vzhaipd.$CONTAINER_ID.pid"					# ha daemon pidfile
+VZHAIPD_CONFIG="/vz/root/$CONTAINER_ID/etc/vzhaipd.conf"			# if set load config to overwrite specific default values
+HA_CLUSTER_IP_CHECK_INTERVAL=15										# interval between arp checks
+HA_IP_FILE_CHECK_INTERVAL=300										# interval between checking for ha ip file changes
+ON_FAILURE_CHECK_INTERVAL=3											# once an arp check failed, check again after how many seconds
+ON_FAILURE_TAKE_OVER_AFTER=5										# after how many failed arp checks do we take over master status
+MASTER_FRESHNESS_CHECK_INTERVAL=120									# if we're the master, how often do we check that everything is ok with our local config
+PID_CONSISTENCY_CHECK_INTERVAL=600									# how often we check if everything is okay with our pid and our system
+USE_ACCURATE_TIME=false												# should we use the accurate date or the cycle date
+FILE_UMASK=177														# umask to use when creating files - must be identical to FILE_PERMISSIONS or else checks will fail
+FILE_PERMISSIONS=$((777-$FILE_UMASK))								# what permissions should we check for when creating or loading external files
+CMD_ARPSEND="arpsend"												# the arpsend command
+CMD_VZCTL="vzctl"													# the vzctl command
+CMD_VZLIST="vzlist"													# the vzlist command
+################ END OF DEFAULT CONFIGURATION ################
+
+umask "$FILE_UMASK"
+
+CMD_SCRIPT="$0"
+LOCAL_STATE="inactive"
+ACCURATE_DATE='date'
+ACCURATE_UTIME='date +%s'
+REGEX_IPMATCH="^([[:digit:]]+)\.([[:digit:]]+)\.([[:digit:]]+)\.([[:digit:]]+)$"	# variable holds regex to work around issues with bash <3.2
+
+# do the 'normal' mount stuff inside this function
+function mount
+{
+	log 10 mounting stuff
+}
+
+
+# this function sets the current date
+# it is called on startup and than every daemon cycle
+function set_date
+{
+	if [ $USE_ACCURATE_TIME = "true" ]
+	then
+		DATE=''
+		UTIME=''
+
+		log 110 using accurate time
+	else
+		DATE=$($ACCURATE_DATE)
+		UTIME=$($ACCURATE_UTIME)
+
+		log 110 using inaccurate time
+	fi
+	
+	log 110 current utime is ${UTIME:-$($ACCURATE_UTIME)} or ${DATE:-$($ACCURATE_DATE)}
+}
+
+# the daemon function that will run forever (or until we receive a SIGINT/TERM)
+function daemon
+{
+	LAST_HA_CLUSTER_IP_CHECK=0
+	LAST_IP_FILE_CHECK=0
+	LAST_IP_FILE_MODIFIED=0
+	LAST_MASTER_FRESHNESS_CHECK=0
+	LAST_PID_CONSISTENCY_CHECK=0
+	HA_IPS_ADD=""
+	HA_IPS_DEL=""
+	DAEMON_RUN=true
+
+	trap "trapped TERM" TERM
+	trap "trapped INT" INT
+	trap "trapped HUP" HUP
+	trap "trapped USR1" USR1
+
+	log 20 started ha daemon with pid $$
+
+	write_pid
+
+	load config
+
+	wait_for_container_start
+
+	become slave
+
+	while $DAEMON_RUN
+	do
+		log 100 starting daemon cycle
+
+		# in trying to keep the use of external command calling to a minimum we
+		# will use one timestamp per cycle... therefor most checks are not
+		# accurate to the second but do suffice our purpose
+		set_date
+
+		# here we do two global checks that are required for both, master and slave operation
+		if [ $(($LAST_IP_FILE_CHECK+$HA_IP_FILE_CHECK_INTERVAL)) -lt ${UTIME:-$($ACCURATE_UTIME)} ]
+		then
+			log 60 last ip file check was $LAST_IP_FILE_CHECK, now is ${UTIME:-$($ACCURATE_UTIME)}... checking freshness
+			load clusterips
+		else
+			log 100 last ip file check was $LAST_IP_FILE_CHECK, now is ${UTIME:-$($ACCURATE_UTIME)}... doing nothing
+		fi
+		
+		if [ $(($LAST_PID_CONSISTENCY_CHECK+$PID_CONSISTENCY_CHECK_INTERVAL)) -lt ${UTIME:-$($ACCURATE_UTIME)} ]
+		then
+			log 80 last pid consistency check was $LAST_PID_CONSISTENCY_CHECK, now is ${UTIME:-$($ACCURATE_UTIME)}... checking pid consistency
+			check_pid_consistency
+		else
+			log 100 last pid consistency check was $LAST_PID_CONSISTENCY_CHECK, now is ${UTIME:-$($ACCURATE_UTIME)}... doing nothing
+		fi
+
+
+		if [ $LOCAL_STATE = "slave" ]
+		then
+			log 100 checking ha ip availability
+			check_ha_ip_availability $ON_FAILURE_TAKE_OVER_AFTER
+
+			if [ $? -eq 0 ]
+			then
+				log 100 ha ip check successfull
+			else
+				log 20 ha ip check failed... becoming master
+				become master
+			fi
+		elif [ $LOCAL_STATE = "master" ]
+		then
+			if [ $(($LAST_MASTER_FRESHNESS_CHECK+$MASTER_FRESHNESS_CHECK_INTERVAL)) -lt ${UTIME:-$($ACCURATE_UTIME)} ]
+			then
+				log 80 we are the master and we should check our state
+				ensure_master_freshness
+
+				log 80 checking ha ip availability
+				check_ha_ip_availability 1
+
+				if [ $? -eq 0 ]
+				then
+					log 20 external ha ip check successfull... this is bad... becoming slave
+					become slave
+					
+					local SLEEP_FOR=$(echo $RANDOM | sed -e 's/\([0-9]\)/\1./')
+					log 60 sleeping for $SLEEP_FOR seconds to escape possible split brain and race conditions
+					sleep "$SLEEP_FOR"
+				else
+					log 80 external ha ip check failed... this is good as we are the master
+				fi
+			else
+				log 100 we are the fresh master
+			fi
+		else
+			warn 20 we are in an unknown state... time to panic
+		fi
+		
+		sleep $HA_CLUSTER_IP_CHECK_INTERVAL
+	done
+}
+
+
+# this function checks if everything is okay with our pid
+function check_pid_consistency
+{
+	LAST_PID_CONSISTENCY_CHECK=${UTIME:-$($ACCURATE_UTIME)}
+	local EVERYTHING_OKAY=1
+	
+	if [ -f "$DAEMON_PIDFILE" ]
+	then
+		log 80 our pid file $DAEMON_PIDFILE exists... this is good
+		
+		local DAEMON_PIDFILE_PERMS=$(stat -c %a "$DAEMON_PIDFILE")
+		if [ $DAEMON_PIDFILE_PERMS -eq $FILE_PERMISSIONS ]
+		then
+			log 80 our pid file has permissions $FILE_PERMISSIONS... fine
+		else
+			warn 20 our pid file has permissions $DAEMON_PIDFILE_PERMS but I expected $FILE_PERMISSIONS... this is not good and I will not read from this file... aborting checks
+			return 1
+		fi
+
+		PIDFILE_PID=$(< "$DAEMON_PIDFILE")
+		
+		if [ $PIDFILE_PID -eq $$ ]
+		then
+			log 80 our pid is equal to the pid in the pid file... everything seems to be okay
+		else
+			warn 20 our pid $$ differs from the one in the pid file $PIDFILE_PID... that is generally a bad thing... trying to investigate
+			
+			kill -USR1 "$PIDFILE_PID"
+			
+			if [ $? -eq 0 ]
+			then
+				warn 20 there is another process running with that pid $PIDFILE_PID... i will assume that someone forgot to shut me down and do it myself
+				local EVERYTHING_OKAY=0
+			else
+				warn 20 there is no other process behind that pid... this is wired but i will try to recover by replace the pid file with my own pid
+				write_pid
+			fi
+		fi
+	else
+		warn 20 our pid file $DAEMON_PIDFILE is missing... this is not good... recreating it
+		write_pid
+	fi
+	
+	if [ $EVERYTHING_OKAY -eq 1 ]
+	then
+		log 60 all pid checks okay
+	else
+		warn 10 one or more pid checks failed... aborting without touching the running system
+		exit 0
+	fi
+}
+
+
+# this function waits for container CONTAINER_ID
+# and blocks until it's status is running
+# it is called only once, directly after startup
+function wait_for_container_start
+{
+	local RUNNING=0
+
+	log 50 waiting for container start
+	
+	while (( $RUNNING < 1 ))
+	do
+		set_date
+		get_container_status "$CONTAINER_ID"
+		local RUNNING=$?
+
+		sleep 30	# sleep for a while - even if we're running we want to give services a chance to start up before we execute the stop command
+	done
+}
+
+# this will care about starting and pid writing
+function write_pid
+{
+	if [ -f "$DAEMON_PIDFILE" ]
+	then
+		local OLD_PID=$(< "$DAEMON_PIDFILE")
+		warn 20 found an old pid file with pid $OLD_PID... trying to kill it
+
+		kill -TERM "$OLD_PID" > /dev/null 2>&1
+		
+		if [ $? -eq 0 ]
+		then
+			warn 20 sent SIGTERM to old pid $OLD_PID... waiting 30 seconds before sending SIGKILL
+			sleep 30
+			kill -KILL "$OLD_PID" > /dev/null 2>&1
+		else
+			warn 20 old pid $OLD_PID seems to result from a stale pid file, no process with that pid running
+		fi
+	fi
+
+	echo "$$" > "$DAEMON_PIDFILE"
+
+	if [ $? -eq 0 ]
+	then
+		log 20 wrote pid $$ to $DAEMON_PIDFILE...
+	else
+		warn 10 failed to write pid $$ to file $DAEMON_PIDFILE... aborting
+		abort
+	fi
+}
+
+# returns > 0 if container status is 'running'
+function get_container_status
+{
+	local ID=$1
+	local RETURN=0
+
+	local CONTAINER_STATUS=$("$CMD_VZLIST" -o status "$ID" | tail -1)
+	local CONTAINER_STATUS=${CONTAINER_STATUS// }
+
+	log 60 container status is: $CONTAINER_STATUS
+
+	case "$CONTAINER_STATUS" in
+		stopped)
+			local RETURN=0
+		;;
+		running)
+			local RETURN=1
+		;;
+		*)
+			local RETURN=0
+		;;
+	esac
+
+	return $RETURN
+}
+
+# makes sure that the master has all ha ips up that he's supposed to have up
+function ensure_master_freshness
+{
+	log 40 ensuring master ha ips freshness
+	LAST_MASTER_FRESHNESS_CHECK=${UTIME:-$($ACCURATE_UTIME)}
+
+	# we just call the same add_ips function as if we were to become master
+	# vzctl works quite fast when trying to add IPs that already exist
+	# so it's easier to let vzctl do the work instead of iterating ourself
+	add_ips
+}
+
+# is called when we're supposed to change our
+# state. let's us become master or slave
+function become
+{
+	local WHAT=$1
+	
+	if [ X"$WHAT" = Xmaster ]
+	then
+		log 30 becoming master
+		LOCAL_STATE=master
+		
+		load clusterips
+
+		add_ips
+
+		if [ $? -eq 0 ]
+		then
+			log 50 successfully added all ips
+
+			log 50 executing start cmd: ${START_CMD:-"no start command defined - doing nothing"}
+			${START_CMD:-:} > /dev/null 2>&1
+	
+			if [ $? -eq 0 ]
+			then
+				log 50 successfully executed start cmd
+			else
+				log 30 failed to execute start cmd
+			fi		
+		else
+			log 30 failed to add one or more ips... skipping start command and trying to recover to slave mode
+			
+			become slave
+		fi		
+
+
+	elif [ X"$WHAT" = Xslave ]
+	then
+		log 30 becoming slave
+		
+		# if we are the current master or inactive and supposed to become
+		# slave do remove all ha ips first. otherwise just set
+		# the local state to slave
+		if [ $LOCAL_STATE = "master" -o $LOCAL_STATE = "inactive" ]
+		then
+			step_down
+		else
+			LOCAL_STATE=slave
+		fi
+	else
+		warn 30 sorry but I do not know how to become $WHAT
+	fi
+}
+
+# the next two functions will add or remove ha ips to/from a container.
+# in older versions of the script we did this by executing a single
+# --ipadd for each ip in a for loop. however it is much (like 200 times with lots of ips)
+# faster to have vzctl add several ips at once. to make sure that we don't
+# pass too many arguments we make use of xargs. however to ensure that xargs
+# won't split based on 0x20 (space - which would mean that we might end up with the
+# --ipadd argument in one line and the ip itself in another)
+# we tell it to split based on \0 (NUL).
+# this however has the side effect that xargs will pass the whole
+# "--ipadd x.x.x.x" as one single argument to vzctl. to avoid this we
+# just echo the complete command and pass it to sh
+# fixme: find a better, more straight forward solution
+function add_ips
+{
+	log 10 adding all ips to container $CONTAINER_ID
+	
+	echo -ne $HA_IPS_ADD | xargs -0 echo \"$CMD_VZCTL\" set \"$CONTAINER_ID\" |
+	(
+		local RETURN=0
+		while read CMD_IPS_ADD
+		do
+			echo $CMD_IPS_ADD | sh > /dev/null 2>&1
+		
+			if [ $? -eq 0 ]
+			then
+				log 60 successfully added ips to container $CONTAINER_ID
+			else
+				warn 10 failed to add ips to container $CONTAINER_ID
+				local RETURN=1
+			fi
+		done
+		
+		exit $RETURN
+	)
+	
+	return $?
+}
+
+function del_ips
+{
+	log 10 removing all ips from container $CONTAINER_ID
+	
+	echo -ne $HA_IPS_DEL | xargs -0 echo \"$CMD_VZCTL\" set \"$CONTAINER_ID\" |
+	(
+		local RETURN=0
+		while read CMD_IPS_DEL
+		do
+			echo $CMD_IPS_DEL | sh > /dev/null 2>&1
+	
+			if [ $? -eq 0 ]
+			then
+				log 60 successfully removed ips from container $CONTAINER_ID
+			else
+				warn 10 failed to remove ips from container $CONTAINER_ID
+				local RETURN=1
+			fi
+		done
+		
+		exit $RETURN
+	)
+
+	return $?
+}
+
+# this function loads the file that contains a list of ips that
+# should failover (together with the HA_CLUSTER_IP configured above)
+# it prepares two strings. one that contains the vzctl --ipadd statements terminated
+# by a NUL char and one that contains the --ipdel statements also terminated by NUL
+function load
+{
+	local WHAT=$1
+
+	if [ X"$WHAT" = Xclusterips ]
+	then
+		log 30 checking cluster ips file for additional ha ips
+		LAST_IP_FILE_CHECK=${UTIME:-$($ACCURATE_UTIME)}
+
+		if [ -f "$HA_IP_FILE" ]
+		then
+			local IP_FILE_MODIFIED=$(stat -c %Y "$HA_IP_FILE")
+			if [ $IP_FILE_MODIFIED -ne $LAST_IP_FILE_MODIFIED ]
+			then
+				log 30 cluster ip file has changed since last load... reloading
+
+				LAST_IP_FILE_MODIFIED=$IP_FILE_MODIFIED
+
+				HA_IPS_ADD="--ipadd $HA_CLUSTER_IP\\0"
+				HA_IPS_DEL=""
+
+				for IP in $(< "$HA_IP_FILE")
+				do
+					if [[ "${IP}" =~ $REGEX_IPMATCH ]]
+					then
+						if [ \
+							${BASH_REMATCH[1]} -gt -1 -a ${BASH_REMATCH[1]} -lt 256 -a \
+							${BASH_REMATCH[2]} -gt -1 -a ${BASH_REMATCH[2]} -lt 256 -a \
+							${BASH_REMATCH[3]} -gt -1 -a ${BASH_REMATCH[3]} -lt 256 -a \
+							${BASH_REMATCH[4]} -gt -1 -a ${BASH_REMATCH[4]} -lt 256 \
+							]
+						then
+							log 80 loaded ha ip $IP
+							HA_IPS_ADD=$HA_IPS_ADD"--ipadd $IP\\0"
+							HA_IPS_DEL=$HA_IPS_DEL"--ipdel $IP\\0"
+						else
+							warn 40 $IP is an invalid ip address... skipping
+						fi
+					else
+						warn 40 $IP is not an ip address... skipping
+					fi
+				done
+				HA_IPS_DEL=$HA_IPS_DEL"--ipdel $HA_CLUSTER_IP\\0"
+
+				log 70 loaded $HA_IP_FILE at $LAST_IP_FILE_CHECK last modified $LAST_IP_FILE_MODIFIED
+			else
+				log 30 cluster ip file has not changed since last load
+			fi
+		else
+			log 30 there is no cluster ip file $HA_IP_FILE... not loading additional ha ips
+			HA_IPS_ADD="--ipadd $HA_CLUSTER_IP\\0"
+			HA_IPS_DEL="--ipdel $HA_CLUSTER_IP\\0"
+		fi
+	elif [ X"$WHAT" = Xconfig ]
+	then
+		if [ -f "$VZHAIPD_CONFIG" ]
+		then
+
+			local VZHAIPD_CONFIG_PERMS=$(stat -c %a "$VZHAIPD_CONFIG")
+			if [ $VZHAIPD_CONFIG_PERMS -eq $FILE_PERMISSIONS ]
+			then
+				log 80 our config file has permissions $FILE_PERMISSIONS... fine
+
+				log 30 loading external config file $VZHAIPD_CONFIG
+				source "$VZHAIPD_CONFIG"
+			else
+				warn 20 our config file has permissions $VZHAIPD_CONFIG_PERMS but I expected $FILE_PERMISSIONS... this is not good and I will not read from this file... aborting
+				abort
+			fi
+		else
+			log 60 no external config file $VZHAIPD_CONFIG found... using defaults
+		fi
+		log 30 scheduling ha ips reload
+		LAST_IP_FILE_CHECK=0
+		LAST_MASTER_FRESHNESS_CHECK=0
+	else
+		warn 30 sorry but I do not know how to load $WHAT
+	fi
+}
+
+# this function is called when we shut down or become slave
+# it will first execute the stop command and then remove
+# all ha ips from the container
+function step_down
+{
+	log 50 executing stop cmd: ${STOP_CMD:-"no stop command defined - doing nothing"}
+	${STOP_CMD:-:} > /dev/null 2>&1
+
+	if [ $? -eq 0 ]
+	then
+		log 50 successfully executed stop cmd
+	else
+		log 30 failed to execute stop cmd... removing ha ips anyway
+	fi
+
+	del_ips
+
+	LOCAL_STATE=slave
+}
+
+# abort the script because of some fatal error
+function abort
+{
+	warn 20 aborting operation
+
+	rm -f "$DAEMON_PIDFILE" > /dev/null 2>&1
+	exit 1
+}
+
+# this function is called when we receive a TERM signal
+function shut_down
+{
+	log 10 shutting down
+
+	DAEMON_RUN=false	# fixme: this should be unnecessary
+
+	step_down
+
+	log 10 bye
+
+	rm -f "$DAEMON_PIDFILE" > /dev/null 2>&1
+	exit 0
+}
+
+# checks if HA_CLUSTER_IP is available on an external interface HA_INTERFACE
+function check_ha_ip_availability
+{
+	local NUM_TRIES=$1
+	local RETURN=1
+	LAST_HA_CLUSTER_IP_CHECK=${UTIME:-$($ACCURATE_UTIME)}
+
+	for (( i=1; i <= $NUM_TRIES; i++ ))
+	do
+
+		arp_check "$HA_CLUSTER_IP" "$HA_INTERFACE"
+		local CMD_ARPSEND_RETVAL=$?
+		
+		if [ $CMD_ARPSEND_RETVAL -eq 3 ]
+		then
+			log 80 cluster ip $HA_CLUSTER_IP on interface $HA_INTERFACE is up on check number $i
+			RETURN=0
+			break
+		elif [ $CMD_ARPSEND_RETVAL -eq 2 ]
+		then
+			warn 20 an arpsend system error occured
+		elif [ $CMD_ARPSEND_RETVAL -eq 1 ]
+		then
+			warn 20 an arpsend usage error occured
+		elif [ $CMD_ARPSEND_RETVAL -eq 0 ]
+		then
+			warn 10 ip $HA_CLUSTER_IP on interface $HA_INTERFACE is down on check number $i
+			local RETURN=1
+		else
+			warn 20 an unknown error occured while checking ha ip
+		fi
+
+		sleep $ON_FAILURE_CHECK_INTERVAL
+	done
+
+	return $RETURN
+}
+
+# checks for the presents of a specific ip on the ethernet bus of a local interface
+function arp_check
+{
+	local CHECK_IP=$1; shift
+	local CHECK_INTERFACE=$1; shift
+
+	"$CMD_ARPSEND" -c 1 -w 1 -D -e "$CHECK_IP" "$CHECK_INTERFACE" > /dev/null 2>&1
+
+	return $?
+}
+
+# does the signal handling
+function trapped
+{
+	local WHAT="$1"
+
+	case "$WHAT" in
+		TERM)
+			warn 10 catched $WHAT... shutting down
+			shut_down
+			;;
+		INT)
+			warn 10 catched $WHAT... aborting
+			abort
+			;;
+		HUP)
+			warn 80 catched $WHAT... reloading config
+			load config
+			;;
+		USR1)
+			:	# NOOP someone just checked if we're alive
+			;;
+		*)
+			warn 50 catched $WHAT... dunno what to do with it... ignoring
+			;;
+	esac
+}
+
+# start the daemon and fork it to the background
+# but don't nohup it as we want it to depend on the
+# container's session
+# also redirect output to /dev/null, otherwise container
+# won't start
+function start
+{
+	echo Starting ha ip daemon
+	"$CMD_SCRIPT" daemon > /dev/null 2>&1 &
+	exit 0
+}
+
+# sends a SIGTERM to the daemon, usually called by the umount script
+function stop
+{
+	load config
+
+	log 10 stopping ha ip daemon
+
+	if [ -f "$DAEMON_PIDFILE" ]
+	then
+		DAEMON_PID=$(< "$DAEMON_PIDFILE")
+		
+		kill -TERM "$DAEMON_PID" > /dev/null 2>&1
+		
+		if [ $? -eq 0 ]
+		then
+			log 10 sent SIGTERM to pid $DAEMON_PID
+		else
+			warn 10 failed to send SIGTERM to pid $DAEMON_PID
+		fi
+		
+		exit 0
+	else
+		warn 30 ha daemon pid file $DAEMON_PIDFILE not found... aborting
+		exit 1
+	fi
+}
+
+function log
+{
+	printline /dev/stdout $*
+}
+
+function warn
+{
+	printline /dev/stderr $*
+}
+
+# print a formated line to some output device or file
+function printline
+{
+	local LOG_TO=$1; shift
+	local LOG_AT_LEVEL=$1; shift
+	local LOG_DATA="$*"
+	
+	if [ X"$LOG_FILE" != "X" ]
+	then
+		LOG_TO="$LOG_FILE"
+	fi
+	
+	if [ $LOG_AT_LEVEL -lt $LOG_LEVEL -o $LOG_AT_LEVEL -eq $LOG_LEVEL ]
+	then
+		printf "%s [%i] [%s] (%i) %s\n" \
+			"${DATE:-$($ACCURATE_DATE)}" \
+			"$$" \
+			"$LOCAL_STATE" \
+			"$LOG_AT_LEVEL" \
+			"$LOG_DATA" \
+			>> "$LOG_TO"
+	fi
+}
+
+
+##### start of the main script #####
+
+# set up the current date depending on whether it should be accurate or not
+set_date
+
+case "$1" in
+	daemon)
+		daemon
+	;;
+	start)		# doesn't really get called but doesn't hurt either
+		start
+	;;
+	stop)
+		stop
+	;;
+	*)
+		mount
+		start
+	;;
+esac
+
+
+exit 0
+
+
+
+: <<'END_OF_DOCS'
+
+=head1 NAME
+
+vzhaipd -- a set of Virtuozzo/OpenVZ mount/umount Container scripts that will make sure a HA IP is always present on one of two or more Containers
+
+=head1 DESCRIPTION
+
+The purpose of this script is to make sure that one or more IP addresses are always available on one of two or more containers
+
+ WARNING: Make sure this script as well as HA_IP_FILE and VZHAIPD_CONFIG are chmod 0700 resp. 0600.
+          Also note that if either of the two reside within a container,
+          the container's root user might mess up your host system!
+          And please be careful what START_CMD and STOP_CMD you define. Both can be
+          overridden in VZHAIPD_CONFIG!
+
+NOTE: This script is meant to be run with two or more containers each running on
+       a different host system. if you run the script with two containers on the same
+       host system it will work, however it will constantly try to become master, fail and
+       fall back to slave mode since it won't get it's arp requests answered. this is not
+       a problem per se but it's ugly and also having a ha script run on the same hardware
+       doesn't seem to be a very smart choice now does it?
+
+
+INSTALLATION OVERVIEW
+
+Just copy the two scripts to your /vz/private/<CTID>/scripts/ directory. If you're still using Virtuozzo 3 copy them to
+/etc/sysconfig/vz-scripts/<CTID>.mount and /etc/sysconfig/vz-scripts/<CTID>.umount. Though I strongly suggest to upgrade to Virtuozzo 4
+and vzctl convert <CTID>. The reason for this is that while VZ3 only migrates it's mount script, VZ4 will migrate the whole 'scripts'
+directory. So with VZ4 it is much easier to maintain an external config file.
+
+
+CONFIGURATION OVERVIEW 
+
+- VZHAIPD_CONFIG
+There's several options you can set either directly within this script (not recommended) or inside an external config file/script. The path and name of the
+external config file are defined in VZHAIPD_CONFIG. The default value is /vz/private/<CTID>/scripts/vzhaipd.conf
+If you need to change this path you obviously have to do it inside the mount script. It is important that this script has EXACTLY the access rights defined in FILE_PERMISSIONS.
+Otherwise the mount script will shut down upon start. More explanation about this behaviour follows in the FILE_PERMISSIONS section.
+
+- HA_CLUSTER_IP
+The IP address this script will check for. To do so what this script does is it sends out an arp request on HA_INTERFACE. If it gets an answer
+it will assume that HA_CLUSTER_IP is available and go to slave mode. However should it get no answer after ON_FAILURE_TAKE_OVER_AFTER tries it will switch
+to master mode. Which means that it will first add HA_CLUSTER_IP as well as any additional IPs defined in HA_IP_FILE (if any) to the container. If this succeeds
+it will execute START_CMD.
+
+- HA_INTERFACE
+The host system's network interface the mount script will send out it's arp requests on. Usually eth0, eth1 or bond0.
+
+- HA_IP_FILE
+Path to the file that contains additional IPs that should be added/removed to the container upon becoming master/slave. The mount script will check for this file upon
+config load and than again every HA_IP_FILE_CHECK_INTERVAL seconds. The format of the file should be one IPv4 address per line. If a line does not look like an IP address
+the script will ignore it and continue with the next line. The HA_IP_FILE is not affected by the FILE_PERMISSIONS setting as we only read from it and don't execute anything.
+However you should still make sure the file has proper access permissions as you might not want unauthorized users to add/delete IP addresses without you knowing.
+
+- START_CMD
+This command is executed when we become master. To be exact it is executed after all IPs have been added to the container and only if we were able to add the successfully.
+Be aware that this command is executed on the host system! If you like to execute a command inside the container you should prefix this with 'vzctl exec $CONTAINER_ID ...'
+The return value of this command does not have any effect on anything.
+If this command is not defined nothing will be executed
+
+- STOP_CMD
+This command is executed when we become slave. It is executed before all IPs are removed from the container. Also it is executed 30 seconds after the container is started and
+changes it's state to 'running'.
+The return value of this command does not have any effect on anything.
+If this command is not defined nothing will be executed
+
+- LOG_LEVEL
+A number between 0 and 900. It defines what messages are logged. Messages with higher severity have lower logging numbers. Something between 70-99 will produce a reasonable
+amount of output. Anything equal to or above 100 will produce quite alot of output.
+
+- LOG_FILE
+The file we are supposed to write our log output to. If this isn't set the script will output to stdout/stderr
+
+- DAEMON_PIDFILE
+The script's pid file. It is strongly recommended that it contains the CONTAINER_ID. Otherwise, if you run multiple instances of this script they
+will kill each other. The pid file is created with FILE_UMASK access permissions. The file is checked every PID_CONSISTENCY_CHECK_INTERVAL seconds for consistency.
+That is the script will check if the access permissions are equal to FILE_PERMISSIONS. Also if will check if it's own pid is the same as the one from the pid file.
+If it isn't it will check if the pid defined in the file is a running process. If so it will end itself, assuming that it was replaced by a new instance of this script. However
+if there's no other process running with this pid it will overwrite the file with it's own pid, thereby making itself the authoritative instance of this script again.
+
+- HA_CLUSTER_IP_CHECK_INTERVAL
+Defines the interval between arp checks in seconds. Something between 3 - 30 is a reasonable number. To put it in simple words this is how often the script will check if HA_CLUSTER_IP is available.
+
+- HA_IP_FILE_CHECK_INTERVAL
+Defines how often we should check for changes of HA_IP_FILE. This means that you can add or remove IPs to HA_IP_FILE while this script is running, without the need to restart the container or this script.
+The script will check the last modified timestamp of HA_IP_FILE and if it differs from the one of it's last load it will reload the file. Any new IP addresses will automatically be added after MASTER_FRESHNESS_CHECK_INTERVAL.
+
+- ON_FAILURE_CHECK_INTERVAL
+Defines the interval between arp checks if the first one failed. I.e. you might define something like HA_IP_FILE_CHECK_INTERVAL=15 and ON_FAILURE_CHECK_INTERVAL=3. This means that the script will check if HA_CLUSTER_IP is
+available every 15 seconds. If a check should fail all following checks (defined by ON_FAILURE_TAKE_OVER_AFTER) will be done after waiting only 3 seconds instead of 15.
+
+- ON_FAILURE_TAKE_OVER_AFTER
+As explained in section ON_FAILURE_CHECK_INTERVAL this defines the number of IP availability checks the script will do before deciding that the other container is probably
+down and becoming master itself. Something like 3 or 5 is a reasonable value.
+
+- MASTER_FRESHNESS_CHECK_INTERVAL
+Defines how often we try to make sure that the container has all IPs assigned that are defined in HA_IP_FILE. In other words when the script sees that HA_IP_FILE has changed and reloads it, this function will make sure that
+the newly added IPs are also added to the container. However it will not remove any IPs from the container. So if you removed IPs from HA_IP_FILE the only way to remove them
+from the container is to either shut it down / restart it or to let the container become slave and than master again. How this is done is explained in a later section.
+
+- PID_CONSISTENCY_CHECK_INTERVAL
+How often we check if our pid file has the correct access permissions and if the pid inside the file is the same as our own. If the file does not have the correct access permissions the function will return and not read
+from the pid file. So make sure that FILE_UMASK (the permissions the file is created with) and FILE_PERMISSIONS (the permissions the script checks for) are the same. Though not literally - the one is a umask the other are
+permission bits. Or to make it easy FILE_UMASK+FILE_PERMISSIONS must add up to 777 otherwise this check will return without further checking the pid files content.
+If the permission check succeeeds the script will read the pid inside the file and continue it's checks as described in section DAEMON_PIDFILE.
+
+- USE_ACCURATE_TIME
+This can be 'true' or 'false'. If it's set to 'true' than the script will execute the 'date' command whenever it displays or calculates a time/date related thing. If it's set to false it will only update the current time value
+every daemon cycle which is relatively close to HA_CLUSTER_IP_CHECK_INTERVAL seconds. For normal operation you can leave this set to false. However if you prefer a more accurate timing and more accurate time stamps in your log you can
+set it to true. However know this will execute 'date' like 50 times per cycle. Which on modern systems won't have any considerable impact. Still it's usually an unnecessary waste of resources.
+
+- FILE_UMASK
+The umask files will get created with. Currently only the pid file is affected by this setting.
+
+- FILE_PERMISSIONS
+The permission bits we should check for when checking file permissions. This should be 777-FILE_UMASK.
+
+- CMD_ARPSEND
+The arpsend command. On default Virtuozzo installations it is safe to just leave this as 'arpsend' as the command is within your $PATH. However if you want to you can set the full path to the binary.
+
+- CMD_VZCTL
+The vzctl command. Everything said for CMD_ARPSEND applies here too.
+
+- CMD_VZLIST
+The vzlist command. Everything said for CMD_ARPSEND applies here too.
+
+
+=head1 LICENSE AND COPYRIGHT
+
+   Copyright [2008-2009] [scoyo GmbH]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+=cut
+
+END_OF_DOCS

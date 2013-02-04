@@ -1,0 +1,16 @@
+* Thu Feb 19 2009 Lukas Loesche <lukas.loesche@scoyo.com> - beta0.2
+- fixed the IP check regex part to make vzhaipd compatible with bash 3.2+
+
+* Mon Nov 10 2008 Lukas Loesche <lukas.loesche@scoyo.com> - beta0.1.2
+- fixed some documentation
+- minor refactoring
+- made IP_FILE_MODIFIED local
+- changed LAST_IP_FILE_MODIFIED to use the value we just retrieved in IP_FILE_MODIFIED instead of calling 'stat' a second time
+- added the CHANGELOG to the release package
+- added an example vzhaipd.conf to the release package, including configuration but also code that get's executed whenever we load the config
+
+* Fri Oct 31 2008 Lukas Loesche <lukas.loesche@scoyo.com> - beta0.1.1
+- added the documentation to the release package
+
+* Fri Oct 31 2008 Lukas Loesche <lukas.loesche@scoyo.com> - beta0.1
+- initial release.

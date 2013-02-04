@@ -1,0 +1,15 @@
+Just copy the two mount/umount scripts to your /vz/private/<CTID>/scripts/
+directory. If you're still using Virtuozzo 3 copy them to
+/etc/sysconfig/vz-scripts/<CTID>.mount and
+/etc/sysconfig/vz-scripts/<CTID>.umount. Though I strongly suggest to
+upgrade to Virtuozzo 4 and vzctl convert <CTID>. The reason for this is
+that while VZ3 only migrates it's mount script, VZ4 will migrate the
+whole 'scripts' directory. So with VZ4 it is much easier to maintain an
+external config file.
+
+After that you should create your own config file
+/vz/private/<CTID>/scripts/vzhaipd.conf
+where you define all variables according to your local requirements
+
+Get further documentation by doing a simple 'perldoc mount' or
+take a look at the prepared files in the documentation/ directory
