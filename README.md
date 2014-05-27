@@ -1,11 +1,11 @@
 vzhaipd
 =======
 
-NAME
+#### Name
 
 vzhaipd -- a set of Virtuozzo/OpenVZ mount/umount Container scripts that will make sure a HA IP is always present on one of two or more Containers
 
-DESCRIPTION
+### Description
 
 The purpose of this script is to make sure that one or more IP addresses are always available on one of two or more containers
 
@@ -16,11 +16,11 @@ The purpose of this script is to make sure that one or more IP addresses are alw
           overridden in VZHAIPD_CONFIG!
 NOTE: This script is meant to be run with two or more containers each running on a different host system. if you run the script with two containers on the same host system it will work, however it will constantly try to become master, fail and fall back to slave mode since it won't get it's arp requests answered. this is not a problem per se but it's ugly and also having a ha script run on the same hardware doesn't seem to be a very smart choice now does it?
 
-INSTALLATION OVERVIEW
+### Installation overview
 
 Just copy the two scripts to your /vz/private/<CTID>/scripts/ directory. If you're still using Virtuozzo 3 copy them to /etc/sysconfig/vz-scripts/<CTID>.mount and /etc/sysconfig/vz-scripts/<CTID>.umount. Though I strongly suggest to upgrade to Virtuozzo 4 and vzctl convert <CTID>. The reason for this is that while VZ3 only migrates it's mount script, VZ4 will migrate the whole 'scripts' directory. So with VZ4 it is much easier to maintain an external config file.
 
-CONFIGURATION OVERVIEW
+### Configuration overview
 
 - VZHAIPD_CONFIG There's several options you can set either directly within this script (not recommended) or inside an external config file/script. The path and name of the external config file are defined in VZHAIPD_CONFIG. The default value is /vz/private/<CTID>/scripts/vzhaipd.conf If you need to change this path you obviously have to do it inside the mount script. It is important that this script has EXACTLY the access rights defined in FILE_PERMISSIONS. Otherwise the mount script will shut down upon start. More explanation about this behaviour follows in the FILE_PERMISSIONS section.
 
@@ -64,7 +64,7 @@ CONFIGURATION OVERVIEW
 
 - CMD_VZLIST The vzlist command. Everything said for CMD_ARPSEND applies here too.
 
-LICENSE AND COPYRIGHT
+### License and Copyright
 
    Copyright [2008-2009] [scoyo GmbH]
 
